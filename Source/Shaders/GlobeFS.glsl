@@ -305,7 +305,7 @@ void main()
         return;
     }
 
-#ifdef PER_FRAGMENT_GROUND_ATMOSPHERE
+//#ifdef PER_FRAGMENT_GROUND_ATMOSPHERE
     czm_ellipsoid ellipsoid = czm_getWgs84EllipsoidEC();
 
     float mpp = czm_metersPerPixel(vec4(0.0, 0.0, -czm_currentFrustum.x, 1.0));
@@ -329,11 +329,12 @@ void main()
 
     float sunlitAtmosphereIntensity = clamp((cameraDist - fadeOutDist) / (fadeInDist - fadeOutDist), 0.0, 1.0);
     groundAtmosphereColor = mix(groundAtmosphereColor, fogColor, sunlitAtmosphereIntensity);
-#else
-    vec3 groundAtmosphereColor = fogColor;
-#endif
+//#else
+//    vec3 groundAtmosphereColor = fogColor;
+//#endif
 
-    finalColor = vec4(mix(finalColor.rgb, groundAtmosphereColor, fade), finalColor.a);
+    //finalColor = vec4(mix(finalColor.rgb, groundAtmosphereColor, fade), finalColor.a);
+    finalColor = vec4(groundAtmosphereColor, finalColor.a);
 #endif
 
     gl_FragColor = finalColor;
