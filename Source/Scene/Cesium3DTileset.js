@@ -12,13 +12,13 @@ define([
         '../Core/DoublyLinkedList',
         '../Core/Ellipsoid',
         '../Core/Event',
-        '../Core/getMagic',
         '../Core/JulianDate',
         '../Core/ManagedArray',
         '../Core/Math',
         '../Core/Matrix4',
         '../Core/Resource',
         '../Core/RuntimeError',
+        '../Core/Transforms',
         '../Renderer/ClearCommand',
         '../Renderer/Pass',
         '../ThirdParty/when',
@@ -55,13 +55,13 @@ define([
         DoublyLinkedList,
         Ellipsoid,
         Event,
-        getMagic,
         JulianDate,
         ManagedArray,
         CesiumMath,
         Matrix4,
         Resource,
         RuntimeError,
+        Transforms,
         ClearCommand,
         Pass,
         when,
@@ -181,6 +181,7 @@ define([
         this._selectedTilesToStyle = [];
         this._loadTimestamp = undefined;
         this._timeSinceLoad = 0.0;
+        this._extras = undefined;
 
         this._cullWithChildrenBounds = defaultValue(options.cullWithChildrenBounds, true);
         this._allTilesAdditive = true;
@@ -209,6 +210,9 @@ define([
         this._classificationType = options.classificationType;
 
         this._ellipsoid = defaultValue(options.ellipsoid, Ellipsoid.WGS84);
+
+        this._useBoundingSphereForClipping = false;
+        this._clippingPlaneOffsetMatrix = undefined;
 
         /**
          * Optimization option. Whether the tileset should refine based on a dynamic screen space error. Tiles that are further
@@ -666,12 +670,6 @@ define([
          * @default false
          */
         this.debugShowUrl = defaultValue(options.debugShowUrl, false);
-
-        // A bunch of tilesets were generated that have a leading / in front of all URLs in the tileset JSON file. If the tiles aren't
-        //  at the root of the domain they will not load anymore. If we find a b3dm file with a leading slash, we test load a tile.
-        //  If it succeeds we continue on. If it fails, we set this to true so we know to strip the slash when loading tiles.
-        this._brokenUrlWorkaround = false;
-
         this._credits = undefined;
 
         var that = this;
@@ -696,13 +694,6 @@ define([
                 return Cesium3DTileset.loadJson(resource);
             })
             .then(function(tilesetJson) {
-                return detectBrokenUrlWorkaround(that, resource, tilesetJson);
-            })
-            .then(function(tilesetJson) {
-                if (that._brokenUrlWorkaround) {
-                    deprecationWarning('Cesium3DTileset.leadingSlash', 'Having a leading slash in a tile URL that is actually relative to the tileset JSON file is deprecated.');
-                }
-
                 that._root = that.loadTileset(resource, tilesetJson);
                 var gltfUpAxis = defined(tilesetJson.asset.gltfUpAxis) ? Axis.fromName(tilesetJson.asset.gltfUpAxis) : Axis.Y;
                 that._asset = tilesetJson.asset;
@@ -710,64 +701,15 @@ define([
                 that._geometricError = tilesetJson.geometricError;
                 that._extensionsUsed = tilesetJson.extensionsUsed;
                 that._gltfUpAxis = gltfUpAxis;
+                that._extras = tilesetJson.extras;
+                if (!defined(tilesetJson.root.transform)) {
+                    that._useBoundingSphereForClipping = true;
+                    that._clippingPlaneOffsetMatrix = Transforms.eastNorthUpToFixedFrame(that.boundingSphere.center);
+                }
                 that._readyPromise.resolve(that);
             }).otherwise(function(error) {
                 that._readyPromise.reject(error);
             });
-    }
-
-    function detectBrokenUrlWorkaround(tileset, resource, tilesetJson) {
-        var testUrl = findBrokenUrl(tilesetJson.root);
-
-        // If it's an empty string, we are good to load the tileset.
-        if (!defined(testUrl) || (testUrl.length === 0)) {
-            return tilesetJson;
-        }
-
-        var testResource = resource.getDerivedResource({
-            url : testUrl
-        });
-
-        return testResource.fetchArrayBuffer()
-            .then(function(buffer) {
-                var uint8Array = new Uint8Array(buffer);
-                var magic = getMagic(uint8Array);
-
-                // If its not a b3dm file, then use workaround
-                // This accounts for servers that return an error page with a 200 status code
-                tileset._brokenUrlWorkaround = (magic !== 'b3dm');
-
-                return tilesetJson;
-            })
-            .otherwise(function() {
-                // Tile failed to load, so use the workaround
-                tileset._brokenUrlWorkaround = true;
-                return tilesetJson;
-            });
-    }
-
-    var brokenUrlRegex = /^\/.+\.b3dm$/;
-
-    function findBrokenUrl(node) {
-        var content = node.content;
-        if (defined(content) && defined(content.url)) {
-            if (brokenUrlRegex.test(content.url)) {
-                return content.url;
-            }
-
-            return '';
-        }
-
-        var children = node.children;
-        if (defined(children)) {
-            var count = children.length;
-            for (var i = 0; i < count; ++i) {
-                var result = findBrokenUrl(children[i]);
-                if (defined(result)) {
-                    return result;
-                }
-            }
-        }
     }
 
     defineProperties(Cesium3DTileset.prototype, {
@@ -1177,6 +1119,18 @@ define([
         /**
          * @private
          */
+        clippingPlaneOffsetMatrix : {
+            get : function() {
+                if (this._useBoundingSphereForClipping) {
+                    return this._clippingPlaneOffsetMatrix;
+                }
+                return this.root.computedTransform;
+            }
+        },
+
+        /**
+         * @private
+         */
         styleEngine : {
             get : function() {
                 return this._styleEngine;
@@ -1236,6 +1190,31 @@ define([
         ellipsoid : {
             get : function() {
                 return this._ellipsoid;
+            }
+        },
+
+        /**
+         * Returns the <code>extras</code> property at the top-level of the tileset JSON, which contains application specific metadata.
+         * Returns <code>undefined</code> if <code>extras</code> does not exist.
+         *
+         * @memberof Cesium3DTileset.prototype
+         *
+         * @exception {DeveloperError} The tileset is not loaded.  Use Cesium3DTileset.readyPromise or wait for Cesium3DTileset.ready to be true.
+         *
+         * @type {*}
+         * @readonly
+         *
+         * @see {@link https://github.com/AnalyticalGraphicsInc/3d-tiles/tree/master/specification#specifying-extensions-and-application-specific-extras|Extras in the 3D Tiles specification.}
+         */
+        extras : {
+            get : function() {
+                //>>includeStart('debug', pragmas.debug);
+                if (!this.ready) {
+                    throw new DeveloperError('The tileset is not loaded.  Use Cesium3DTileset.readyPromise or wait for Cesium3DTileset.ready to be true.');
+                }
+                //>>includeEnd('debug');
+
+                return this._extras;
             }
         }
     });
@@ -1520,7 +1499,6 @@ define([
         filterProcessingQueue(tileset);
         var tiles = tileset._processingQueue;
         var length = tiles.length;
-
         // Process tiles in the PROCESSING state so they will eventually move to the READY state.
         for (var i = 0; i < length; ++i) {
             tiles[i].process(tileset, frameState);
@@ -1851,6 +1829,9 @@ define([
         var clippingPlanes = this._clippingPlanes;
         if (defined(clippingPlanes) && clippingPlanes.enabled) {
             clippingPlanes.update(frameState);
+            if (this._useBoundingSphereForClipping) {
+                this._clippingPlaneOffsetMatrix = Transforms.eastNorthUpToFixedFrame(this.boundingSphere.center);
+            }
         }
 
         this._timeSinceLoad = Math.max(JulianDate.secondsDifference(frameState.time, this._loadTimestamp) * 1000, 0.0);
